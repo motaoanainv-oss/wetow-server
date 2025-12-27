@@ -1,0 +1,16 @@
+{
+  "name": "wetow-server",
+  "version": "1.0.0",
+  "description": "WeTow Cars Backend Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.22.1",
+    "express-rate-limit": "^8.2.1"
+  }
+}

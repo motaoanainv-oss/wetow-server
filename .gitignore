@@ -1,0 +1,24 @@
+# Environment Variables (NEVER COMMIT THESE!)
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+.env*.local
+
+# API Keys and Secrets
+*.pem
+*.key
+secrets/
+
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+.expo-shared/
+web-build/
+
+# Logs
+*.log
+npm-debug.log*

@@ -32,9 +32,40 @@ try {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// PayFast config
-const PAYFAST_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '33800919';
-const PAYFAST_PASSPHRASE = process.env.PAYFAST_PASSPHRASE || 'WeTow2026_Secure';
+// ==================== PAYFAST CONFIG (DUAL MODE) ====================
+// The webhook must handle ITNs from BOTH production AND sandbox mode:
+//   - Real customers use production PayFast (live app on Play Store)
+//   - Internal testers use sandbox PayFast (preview EAS build)
+//
+// We distinguish by the `merchant_id` field PayFast includes in every ITN.
+// Each merchant_id has its own passphrase for signature validation.
+//
+// Production credentials come from Render environment variables (as before).
+// Sandbox credentials are PayFast's universal public test creds — documented
+// at https://developer.payfast.co.za/docs#testing_and_tools and can safely
+// be hardcoded (they're public, anyone can use them).
+
+// Production (live customers)
+const PAYFAST_PROD_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '33800919';
+const PAYFAST_PROD_PASSPHRASE = process.env.PAYFAST_PASSPHRASE || 'WeTow2026_Secure';
+
+// Sandbox (internal testers — universal PayFast test creds, safe to hardcode)
+const PAYFAST_SANDBOX_MERCHANT_ID = '10000100';
+const PAYFAST_SANDBOX_PASSPHRASE = 'jt7NOE43FZPn';
+
+/**
+ * Given a received ITN's merchant_id, return the matching credentials.
+ * Returns null if merchant_id is unknown (which means reject the ITN).
+ */
+function credentialsForMerchantId(merchantId) {
+  if (merchantId === PAYFAST_PROD_MERCHANT_ID) {
+    return { mode: 'production', merchantId: PAYFAST_PROD_MERCHANT_ID, passphrase: PAYFAST_PROD_PASSPHRASE };
+  }
+  if (merchantId === PAYFAST_SANDBOX_MERCHANT_ID) {
+    return { mode: 'sandbox', merchantId: PAYFAST_SANDBOX_MERCHANT_ID, passphrase: PAYFAST_SANDBOX_PASSPHRASE };
+  }
+  return null;
+}
 
 // Rate limiting configuration
 const rateLimitMap = new Map();
@@ -102,13 +133,20 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     service: 'WeTow Backend Server',
     firebase: db ? 'connected' : 'not connected',
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    payfastModes: ['production', 'sandbox'],
   });
 });
 
 // ==================== PAYFAST SIGNATURE VERIFICATION ====================
 
-function verifyPayFastSignature(data) {
+/**
+ * Validate a PayFast ITN signature using the supplied passphrase.
+ * @param {object} data The full req.body from PayFast
+ * @param {string} passphrase The passphrase to use (production OR sandbox)
+ * @returns {boolean} true iff the signature matches
+ */
+function verifyPayFastSignature(data, passphrase) {
   const receivedSignature = data.signature;
   if (!receivedSignature) return false;
 
@@ -121,8 +159,8 @@ function verifyPayFastSignature(data) {
     .map(([key, value]) => `${key}=${encodeURIComponent(String(value)).replace(/%20/g, '+')}`)
     .join('&');
 
-  const signatureString = PAYFAST_PASSPHRASE
-    ? `${paramString}&passphrase=${encodeURIComponent(PAYFAST_PASSPHRASE).replace(/%20/g, '+')}`
+  const signatureString = passphrase
+    ? `${paramString}&passphrase=${encodeURIComponent(passphrase).replace(/%20/g, '+')}`
     : paramString;
 
   const calculatedSignature = crypto.createHash('md5').update(signatureString).digest('hex');
@@ -138,16 +176,19 @@ app.post('/payfast/webhook', async (req, res) => {
   try {
     const data = req.body;
 
-    // Step 1: Verify signature
-    if (!verifyPayFastSignature(data)) {
-      console.error('[PayFast ITN] Invalid signature — possible fraud attempt');
-      return res.status(400).send('Invalid signature');
+    // Step 1: Determine which credentials to use (production or sandbox)
+    // based on the merchant_id in the ITN payload.
+    const creds = credentialsForMerchantId(data.merchant_id);
+    if (!creds) {
+      console.error('[PayFast ITN] Unknown merchant_id:', data.merchant_id);
+      return res.status(400).send('Unknown merchant');
     }
+    console.log(`[PayFast ITN] Mode: ${creds.mode}`);
 
-    // Step 2: Verify merchant ID
-    if (data.merchant_id !== PAYFAST_MERCHANT_ID) {
-      console.error('[PayFast ITN] Merchant ID mismatch:', data.merchant_id);
-      return res.status(400).send('Merchant ID mismatch');
+    // Step 2: Verify signature with the correct passphrase
+    if (!verifyPayFastSignature(data, creds.passphrase)) {
+      console.error(`[PayFast ITN] Invalid signature in ${creds.mode} mode — possible fraud attempt`);
+      return res.status(400).send('Invalid signature');
     }
 
     // Step 3: Extract payment details
@@ -157,7 +198,7 @@ app.post('/payfast/webhook', async (req, res) => {
     const amountFee = parseFloat(data.amount_fee || '0');
     const amountNet = parseFloat(data.amount_net || '0');
 
-    console.log(`[PayFast ITN] Job: ${jobId}, Status: ${paymentStatus}, Amount: R${amountGross}`);
+    console.log(`[PayFast ITN] Job: ${jobId}, Status: ${paymentStatus}, Amount: R${amountGross}, Mode: ${creds.mode}`);
 
     if (!jobId) {
       console.error('[PayFast ITN] No job ID (m_payment_id) in payment');
@@ -177,33 +218,41 @@ app.post('/payfast/webhook', async (req, res) => {
       }
 
       if (paymentStatus === 'COMPLETE') {
+        // Flip status to pending_driver_acceptance so dispatch picks it up.
+        // (The notifyDriversOnPaymentConfirmed Cloud Function watches for
+        // this transition and fires the Uber-style serial dispatch.)
         await jobRef.update({
+          status: 'pending_driver_acceptance',
           paymentStatus: 'completed',
           paymentConfirmedAt: admin.firestore.FieldValue.serverTimestamp(),
           paymentConfirmedByWebhook: true,
+          paymentMode: creds.mode, // 'production' or 'sandbox' — useful for audits
           payfastPaymentId: data.pf_payment_id || null,
           payfastAmountGross: amountGross,
           payfastAmountFee: amountFee,
           payfastAmountNet: amountNet,
         });
-        console.log(`[PayFast ITN] Job ${jobId} payment CONFIRMED: R${amountGross}`);
+        console.log(`[PayFast ITN] Job ${jobId} payment CONFIRMED (${creds.mode}): R${amountGross}`);
       } else if (paymentStatus === 'CANCELLED') {
         await jobRef.update({
           paymentStatus: 'cancelled',
           paymentCancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+          paymentMode: creds.mode,
         });
-        console.log(`[PayFast ITN] Job ${jobId} payment CANCELLED`);
+        console.log(`[PayFast ITN] Job ${jobId} payment CANCELLED (${creds.mode})`);
       } else {
         await jobRef.update({
           paymentStatus: paymentStatus.toLowerCase(),
+          paymentMode: creds.mode,
         });
-        console.log(`[PayFast ITN] Job ${jobId} payment status: ${paymentStatus}`);
+        console.log(`[PayFast ITN] Job ${jobId} payment status: ${paymentStatus} (${creds.mode})`);
       }
 
       // Audit log
       await db.collection('paymentLogs').add({
         jobId,
         paymentStatus,
+        paymentMode: creds.mode,
         amountGross,
         amountFee,
         amountNet,
@@ -447,6 +496,7 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`WeTow Server running on port ${PORT}`);
   console.log(`Firebase: ${db ? 'Connected' : 'Not connected'}`);
+  console.log(`PayFast modes: production (${PAYFAST_PROD_MERCHANT_ID}) + sandbox (${PAYFAST_SANDBOX_MERCHANT_ID})`);
   console.log('Endpoints: /health, /autocomplete, /place-details, /geocode, /reverse-geocode, /distance-matrix, /directions');
   console.log('PayFast: /payfast/webhook, /payfast/return, /payfast/cancel');
 });

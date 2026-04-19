@@ -154,8 +154,13 @@ function verifyPayFastSignature(data, passphrase) {
   const params = { ...data };
   delete params.signature;
 
+  // PayFast includes empty-string fields in their own signature calculation.
+  // We must do the same — otherwise every ITN with empty custom_str1-5 or
+  // name_last would fail validation. (This bit us when the sandbox started
+  // populating all fields including empties.) We still skip undefined/null
+  // defensively, but empty strings stay in.
   const paramString = Object.entries(params)
-    .filter(([_, value]) => value !== '' && value !== undefined && value !== null)
+    .filter(([_, value]) => value !== undefined && value !== null)
     .map(([key, value]) => `${key}=${encodeURIComponent(String(value)).replace(/%20/g, '+')}`)
     .join('&');
 

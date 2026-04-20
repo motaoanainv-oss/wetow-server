@@ -223,21 +223,90 @@ app.post('/payfast/webhook', async (req, res) => {
       }
 
       if (paymentStatus === 'COMPLETE') {
-        // Flip status to pending_driver_acceptance so dispatch picks it up.
-        // (The notifyDriversOnPaymentConfirmed Cloud Function watches for
-        // this transition and fires the Uber-style serial dispatch.)
-        await jobRef.update({
-          status: 'pending_driver_acceptance',
-          paymentStatus: 'completed',
-          paymentConfirmedAt: admin.firestore.FieldValue.serverTimestamp(),
-          paymentConfirmedByWebhook: true,
-          paymentMode: creds.mode, // 'production' or 'sandbox' — useful for audits
-          payfastPaymentId: data.pf_payment_id || null,
-          payfastAmountGross: amountGross,
-          payfastAmountFee: amountFee,
-          payfastAmountNet: amountNet,
-        });
-        console.log(`[PayFast ITN] Job ${jobId} payment CONFIRMED (${creds.mode}): R${amountGross}`);
+        // ------------------------------------------------------------
+        // Distinguish between an INITIAL payment and a RECLASSIFICATION
+        // TOP-UP payment. The client writes reclassification.topUpInitiatedAt
+        // and sets job status to 'reclassification_awaiting_topup' before
+        // launching PayFast for a top-up. We use both signals to detect it
+        // (belt and braces — the client could in theory race and we'd see
+        // one flag set but not the other; either is sufficient).
+        //
+        // Crucially, on a top-up we must NOT overwrite the main payment
+        // fields (paymentAmount, paymentStatus, paymentConfirmedAt, etc.)
+        // because those recorded the ORIGINAL payment. And we must NOT
+        // flip job.status to 'pending_driver_acceptance' — that would rewind
+        // the driver back to before they accepted the job, destroying
+        // arrivedAtPickupTime / pinVerified / etc.
+        // ------------------------------------------------------------
+        const jobData = jobDoc.data() || {};
+        const isTopUp =
+          jobData.status === 'reclassification_awaiting_topup' ||
+          !!jobData.reclassification?.topUpInitiatedAt;
+
+        if (isTopUp) {
+          // Resume status — go back to where the driver was before the
+          // reclassification. 'arrivedAtPickupTime' being set (which it
+          // always is by the time a reclassification is submitted) means
+          // the right resumption status is 'at-pickup'. Fall back to
+          // 'driver_arrived' if for some reason we don't have that marker.
+          const resumeStatus = jobData.arrivedAtPickupTime
+            ? 'at-pickup'
+            : 'driver_arrived';
+
+          // New total customer has now paid. We add the top-up on top of
+          // whatever the original paymentAmount was — NOT whatever's in
+          // reclassification.newTotal, because that could theoretically
+          // drift if a customer had a prior top-up on a separate dispute
+          // (we don't support that today, but the additive form is safer).
+          const originalPaid = typeof jobData.paymentAmount === 'number'
+            ? jobData.paymentAmount
+            : 0;
+          const newPaymentAmount = originalPaid + amountGross;
+
+          await jobRef.update({
+            status: resumeStatus,
+            // Top-up-specific fields — the driver app watches topUpStatus
+            // to decide whether to unblock the pickup workflow.
+            'reclassification.topUpStatus': 'paid',
+            'reclassification.topUpPaidAt': admin.firestore.FieldValue.serverTimestamp(),
+            'reclassification.topUpPayfastPaymentId': data.pf_payment_id || null,
+            'reclassification.topUpAmountGross': amountGross,
+            'reclassification.topUpAmountFee': amountFee,
+            'reclassification.topUpAmountNet': amountNet,
+            // Bump the job's recorded total to reflect the new price the
+            // customer has now paid. Earnings / receipts / dashboard read
+            // from paymentAmount so this keeps them truthful.
+            paymentAmount: newPaymentAmount,
+            // Do NOT overwrite paymentConfirmedAt / payfastPaymentId /
+            // paymentConfirmedByWebhook — those are the records of the
+            // ORIGINAL payment and must be preserved for audit purposes.
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(
+            `[PayFast ITN] Job ${jobId} TOP-UP CONFIRMED (${creds.mode}): ` +
+            `+R${amountGross} → new total R${newPaymentAmount.toFixed(2)}; ` +
+            `status resumed to '${resumeStatus}'`
+          );
+        } else {
+          // Initial payment path — this is the ONLY code path that existed
+          // before the reclassification flow was introduced, and it remains
+          // the default for any payment that isn't flagged as a top-up.
+          // Flip status to pending_driver_acceptance so dispatch picks it up.
+          // (The notifyDriversOnPaymentConfirmed Cloud Function watches for
+          // this transition and fires the Uber-style serial dispatch.)
+          await jobRef.update({
+            status: 'pending_driver_acceptance',
+            paymentStatus: 'completed',
+            paymentConfirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+            paymentConfirmedByWebhook: true,
+            paymentMode: creds.mode, // 'production' or 'sandbox' — useful for audits
+            payfastPaymentId: data.pf_payment_id || null,
+            payfastAmountGross: amountGross,
+            payfastAmountFee: amountFee,
+            payfastAmountNet: amountNet,
+          });
+          console.log(`[PayFast ITN] Job ${jobId} payment CONFIRMED (${creds.mode}): R${amountGross}`);
+        }
       } else if (paymentStatus === 'CANCELLED') {
         await jobRef.update({
           paymentStatus: 'cancelled',

@@ -253,15 +253,32 @@ app.post('/payfast/webhook', async (req, res) => {
             ? 'at-pickup'
             : 'driver_arrived';
 
-          // New total customer has now paid. We add the top-up on top of
-          // whatever the original paymentAmount was — NOT whatever's in
-          // reclassification.newTotal, because that could theoretically
-          // drift if a customer had a prior top-up on a separate dispute
-          // (we don't support that today, but the additive form is safer).
+          // The customer's contractual total for this job is reclassification.newTotal,
+          // computed and written by the submitReclassification Cloud Function. That
+          // is the single source of truth — it's what the cloud function used to
+          // calculate the top-up priceDifference, and it's what the customer agreed
+          // to when they accepted the reclassification. We use it directly here
+          // rather than reconstructing original + topUp because:
+          //   1. Adding amountGross + originalPaid double-counts PayFast fees
+          //      (they're embedded in both, but reclassification.newTotal is fee-free)
+          //   2. If paymentAmount is missing for any reason (race, manual edit,
+          //      job came via non-standard flow), the additive form silently
+          //      produces a wrong total — see customer R743.20 incident.
+          //   3. Treating newTotal as authoritative matches what the client
+          //      canonical chain now does (reclassification.newTotal first).
+          //
+          // Fallback: if newTotal is somehow missing (legacy job, cloud function
+          // failure), fall back to additive form so we don't write a worse value.
+          const contractualTotal =
+            typeof jobData.reclassification?.newTotal === 'number'
+              ? jobData.reclassification.newTotal
+              : null;
           const originalPaid = typeof jobData.paymentAmount === 'number'
             ? jobData.paymentAmount
             : 0;
-          const newPaymentAmount = originalPaid + amountGross;
+          const newPaymentAmount = contractualTotal !== null
+            ? contractualTotal
+            : originalPaid + amountGross;
 
           await jobRef.update({
             status: resumeStatus,
@@ -284,7 +301,8 @@ app.post('/payfast/webhook', async (req, res) => {
           });
           console.log(
             `[PayFast ITN] Job ${jobId} TOP-UP CONFIRMED (${creds.mode}): ` +
-            `+R${amountGross} → new total R${newPaymentAmount.toFixed(2)}; ` +
+            `→ paymentAmount set to R${newPaymentAmount.toFixed(2)} ` +
+            `(${contractualTotal !== null ? 'from reclassification.newTotal' : 'fallback additive'}); ` +
             `status resumed to '${resumeStatus}'`
           );
         } else {
@@ -304,6 +322,12 @@ app.post('/payfast/webhook', async (req, res) => {
             payfastAmountGross: amountGross,
             payfastAmountFee: amountFee,
             payfastAmountNet: amountNet,
+            // Make the webhook the authoritative source for paymentAmount, not
+            // the client. amountGross is what PayFast actually charged the
+            // customer — that's the truthful number. The client may have
+            // written an estimate before PayFast opened (paymentInitiatedAt);
+            // we overwrite it here with reality.
+            paymentAmount: amountGross,
           });
           console.log(`[PayFast ITN] Job ${jobId} payment CONFIRMED (${creds.mode}): R${amountGross}`);
         }

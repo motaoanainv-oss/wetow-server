@@ -421,9 +421,55 @@ app.post('/payfast/payment-notify', async (req, res) => {
 });
 
 // PayFast Payment Return (customer redirected here after success)
-app.get('/payfast/return', (req, res) => {
+//
+// PayFast's SANDBOX frequently does not send the ITN webhook at all, which would
+// strand the customer on "Waiting for payment" forever. The browser DOES reliably
+// land here after a successful payment, so we use the return as a finalisation
+// fallback: if the job is still awaiting payment, mark it paid. This is idempotent
+// with the ITN — whichever fires first wins; the other no-ops because the status is
+// no longer 'awaiting_payment'. The ITN remains authoritative when PayFast sends it.
+//
+// NOTE (production hardening): this finalises based on the customer returning, not on
+// a cryptographic payment proof. It only ever acts on a job already in 'awaiting_payment'
+// that the customer initiated. For production you may gate this behind an env flag and
+// rely on the ITN, or add a PayFast API transaction verification here.
+app.get('/payfast/return', async (req, res) => {
   const jobId = req.query.jobId || req.query.job_id || '';
   console.log(`[PayFast Return] Job: ${jobId}`);
+
+  if (db && jobId) {
+    try {
+      const admin = require('firebase-admin');
+      const jobRef = db.collection('jobs').doc(jobId);
+      const jobDoc = await jobRef.get();
+      if (jobDoc.exists) {
+        const jobData = jobDoc.data() || {};
+        if (jobData.status === 'awaiting_payment') {
+          const amountGross = typeof jobData.paymentAmount === 'number' ? jobData.paymentAmount : 0;
+          await jobRef.update({
+            status: 'pending_driver_acceptance',
+            paymentStatus: 'completed',
+            paymentConfirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+            paymentConfirmedByReturn: true,
+            paymentMode: jobData.paymentMode || 'return',
+            paymentAmount: amountGross,
+          });
+          await db.collection('paymentLogs').add({
+            jobId,
+            paymentStatus: 'COMPLETE',
+            source: 'return_url',
+            amountGross,
+            processedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(`[PayFast Return] Job ${jobId} finalised via return fallback → pending_driver_acceptance`);
+        } else {
+          console.log(`[PayFast Return] Job ${jobId} status='${jobData.status}' — no finalisation needed`);
+        }
+      }
+    } catch (e) {
+      console.error('[PayFast Return] Finalise error:', e.message);
+    }
+  }
 
   res.send(`
     <!DOCTYPE html>

@@ -172,6 +172,38 @@ function verifyPayFastSignature(data, passphrase) {
   return calculatedSignature === receivedSignature;
 }
 
+/**
+ * Authoritative server-to-server confirmation with PayFast.
+ * Posts the received ITN payload back to PayFast; PayFast replies 'VALID' or
+ * 'INVALID'. This is PayFast's recommended security check and is robust to the
+ * local MD5 signature-format quirks (field order / empty fields / passphrase)
+ * that repeatedly break sandbox validation. Used as a fallback when our local
+ * signature recomputation does not match.
+ * @param {object} data Full ITN body as received
+ * @param {string} mode 'sandbox' | 'production'
+ * @returns {Promise<boolean>} true iff PayFast confirms the ITN is VALID
+ */
+async function payFastServerConfirm(data, mode) {
+  const host = mode === 'sandbox'
+    ? 'https://sandbox.payfast.co.za'
+    : 'https://www.payfast.co.za';
+  try {
+    const body = Object.entries(data)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+      .join('&');
+    const resp = await axios.post(`${host}/eng/query/validate`, body, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 12000,
+    });
+    const ok = typeof resp.data === 'string' && resp.data.trim().toUpperCase().startsWith('VALID');
+    console.log(`[PayFast ITN] Server confirmation (${mode}): ${ok ? 'VALID' : 'INVALID'} (raw: ${String(resp.data).trim().slice(0, 40)})`);
+    return ok;
+  } catch (e) {
+    console.error('[PayFast ITN] Server confirmation error:', e.message);
+    return false;
+  }
+}
+
 // ==================== PAYFAST PAYMENT ENDPOINTS ====================
 
 // PayFast ITN (Instant Transaction Notification) Webhook — THE CRITICAL ENDPOINT
@@ -190,11 +222,22 @@ app.post('/payfast/webhook', async (req, res) => {
     }
     console.log(`[PayFast ITN] Mode: ${creds.mode}`);
 
-    // Step 2: Verify signature with the correct passphrase
-    if (!verifyPayFastSignature(data, creds.passphrase)) {
-      console.error(`[PayFast ITN] Invalid signature in ${creds.mode} mode — possible fraud attempt`);
+    // Step 2: Validate the ITN. Accept it if EITHER our local signature
+    // recomputation matches OR PayFast's own server confirmation returns VALID.
+    // PayFast's server confirmation is authoritative and robust to the sandbox
+    // signature-format quirks that have repeatedly broken local validation, so
+    // a local mismatch alone is no longer a hard failure.
+    const localOk = verifyPayFastSignature(data, creds.passphrase);
+    let validated = localOk;
+    if (!localOk) {
+      console.warn(`[PayFast ITN] Local signature mismatch in ${creds.mode} mode — falling back to PayFast server confirmation`);
+      validated = await payFastServerConfirm(data, creds.mode);
+    }
+    if (!validated) {
+      console.error(`[PayFast ITN] ITN could not be validated in ${creds.mode} mode (local signature + server confirmation both failed)`);
       return res.status(400).send('Invalid signature');
     }
+    console.log(`[PayFast ITN] Validated via ${localOk ? 'local signature' : 'PayFast server confirmation'}`);
 
     // Step 3: Extract payment details
     const jobId = data.m_payment_id;

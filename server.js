@@ -138,6 +138,26 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Diagnostic: verify the server can actually READ and WRITE Firestore.
+// /health only reports whether the db OBJECT exists, not whether writes succeed
+// (a server with no credentials still gets a non-null db object).
+app.get('/selftest', async (req, res) => {
+  const out = { dbObject: !!db, write: null, read: null, error: null };
+  try {
+    if (db) {
+      const admin = require('firebase-admin');
+      const ref = db.collection('_selftest').doc('ping');
+      await ref.set({ at: admin.firestore.FieldValue.serverTimestamp(), n: Date.now() });
+      out.write = 'ok';
+      const snap = await ref.get();
+      out.read = snap.exists ? 'ok' : 'missing';
+    }
+  } catch (e) {
+    out.error = e.message;
+  }
+  res.json(out);
+});
+
 // ==================== PAYFAST SIGNATURE VERIFICATION ====================
 
 /**

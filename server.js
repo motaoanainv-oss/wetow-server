@@ -138,47 +138,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Diagnostic: verify the server can actually READ and WRITE Firestore.
-// /health only reports whether the db OBJECT exists, not whether writes succeed
-// (a server with no credentials still gets a non-null db object).
-app.get('/selftest', async (req, res) => {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT || '';
-  const out = {
-    dbObject: !!db,
-    envPresent: !!process.env.FIREBASE_SERVICE_ACCOUNT,
-    envLen: raw.length,
-    envHead: raw.slice(0, 6),
-    looksLikeBase64: /^ey/.test(raw),
-    decode: null,
-    projectId: null,
-    write: null,
-    read: null,
-    error: null,
-  };
-  try {
-    if (raw) {
-      try {
-        const j = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
-        out.decode = 'ok';
-        out.projectId = j.project_id || null;
-      } catch (de) {
-        out.decode = 'FAILED: ' + de.message;
-      }
-    }
-    if (db) {
-      const admin = require('firebase-admin');
-      const ref = db.collection('_selftest').doc('ping');
-      await ref.set({ at: admin.firestore.FieldValue.serverTimestamp(), n: Date.now() });
-      out.write = 'ok';
-      const snap = await ref.get();
-      out.read = snap.exists ? 'ok' : 'missing';
-    }
-  } catch (e) {
-    out.error = e.message;
-  }
-  res.json(out);
-});
-
 // ==================== PAYFAST SIGNATURE VERIFICATION ====================
 
 /**

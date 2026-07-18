@@ -282,11 +282,51 @@ app.post('/payfast/webhook', async (req, res) => {
         // arrivedAtPickupTime / pinVerified / etc.
         // ------------------------------------------------------------
         const jobData = jobDoc.data() || {};
+        // Recovery (per 30 min) add-on top-up — the operator logged extra on-scene
+        // recovery time and the customer accepted; this payment is the top-up for it.
+        const isRecoveryTopUp =
+          jobData.status === 'recovery_addon_awaiting_topup' ||
+          !!jobData.recoveryAddon?.topUpInitiatedAt;
         const isTopUp =
           jobData.status === 'reclassification_awaiting_topup' ||
           !!jobData.reclassification?.topUpInitiatedAt;
 
-        if (isTopUp) {
+        if (isRecoveryTopUp) {
+          // RECOVERY TOP-UP. Unlike a reclassification (which REPLACES the total),
+          // recovery time is ADDITIVE — it stacks on top of what the customer has
+          // already paid for the job. Restore the working status the operator was in
+          // so they can finish and close out.
+          const resumeStatus = jobData.recoveryAddon?.priorStatus
+            || (jobData.arrivedAtPickupTime ? 'at-pickup' : 'in_progress');
+          const originalPaid = typeof jobData.paymentAmount === 'number' ? jobData.paymentAmount : 0;
+          // Use the fee-free contractual add-on figure (units × R370 + 5%), not
+          // amountGross, so PayFast processing fees aren't baked into the job total
+          // (same reasoning as the reclassification path below).
+          const addOnAmount = typeof jobData.recoveryAddon?.additionalAmount === 'number'
+            ? jobData.recoveryAddon.additionalAmount
+            : amountGross;
+          const newPaymentAmount = Math.round((originalPaid + addOnAmount) * 100) / 100;
+          const addedUnits = Number(jobData.recoveryAddon?.units) || 0;
+          const priorUnits = Number(jobData.recoveryUnitsTotal) || 0;
+
+          await jobRef.update({
+            status: resumeStatus,
+            'recoveryAddon.topUpStatus': 'paid',
+            'recoveryAddon.topUpPaidAt': admin.firestore.FieldValue.serverTimestamp(),
+            'recoveryAddon.topUpPayfastPaymentId': data.pf_payment_id || null,
+            'recoveryAddon.topUpAmountGross': amountGross,
+            'recoveryAddon.topUpAmountFee': amountFee,
+            'recoveryAddon.topUpAmountNet': amountNet,
+            paymentAmount: newPaymentAmount,
+            recoveryUnitsTotal: priorUnits + addedUnits,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(
+            `[PayFast ITN] Job ${jobId} RECOVERY TOP-UP CONFIRMED (${creds.mode}): ` +
+            `+R${addOnAmount.toFixed(2)} (${addedUnits}x30min) -> paymentAmount R${newPaymentAmount.toFixed(2)}; ` +
+            `status resumed to '${resumeStatus}'`
+          );
+        } else if (isTopUp) {
           // Resume status — go back to where the driver was before the
           // reclassification. 'arrivedAtPickupTime' being set (which it
           // always is by the time a reclassification is submitted) means

@@ -49,9 +49,12 @@ const PORT = process.env.PORT || 3001;
 const PAYFAST_PROD_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '33800919';
 const PAYFAST_PROD_PASSPHRASE = process.env.PAYFAST_PASSPHRASE || 'WeTow2026_Secure';
 
-// Sandbox (internal testers — universal PayFast test creds, safe to hardcode)
-const PAYFAST_SANDBOX_MERCHANT_ID = '10000100';
-const PAYFAST_SANDBOX_PASSPHRASE = 'jt7NOE43FZPn';
+// Sandbox (internal testers) — WeTow's OWN sandbox merchant from
+// sandbox.payfast.co.za. The public shared account (10000100) is unreliable: its
+// passphrase gets changed by other developers. This trio was verified ACCEPTED by
+// the live sandbox (HTTP 302) and MUST match utils/payfast.utils.ts sandbox branch.
+const PAYFAST_SANDBOX_MERCHANT_ID = '10052399';
+const PAYFAST_SANDBOX_PASSPHRASE = 'TESTWE202601';
 
 /**
  * Given a received ITN's merchant_id, return the matching credentials.

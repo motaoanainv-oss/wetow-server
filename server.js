@@ -209,6 +209,126 @@ async function payFastServerConfirm(data, mode) {
 
 // ==================== PAYFAST PAYMENT ENDPOINTS ====================
 
+// PHP urlencode-compatible encoder — MUST match the app's former pfEncode()
+// byte-for-byte (spaces -> '+', and !'()*~ percent-escaped) or PayFast rejects the
+// signature with "Generated signature does not match".
+function pfEncode(value) {
+  return encodeURIComponent(String(value).trim())
+    .replace(/%20/g, '+')
+    .replace(/[!'()*~]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+// Build the outbound PayFast signature exactly as PayFast expects it (same
+// param-string + passphrase + MD5 the app used to do — now server-side only).
+function pfSign(params, passphrase) {
+  const paramString = Object.entries(params)
+    .filter(([, v]) => v !== '' && v !== undefined && v !== null)
+    .map(([k, v]) => `${k}=${pfEncode(v)}`)
+    .join('&');
+  const sigStr = passphrase ? `${paramString}&passphrase=${pfEncode(passphrase)}` : paramString;
+  return crypto.createHash('md5').update(sigStr).digest('hex');
+}
+
+// ---- Signed checkout: returns a fully-signed PayFast redirect URL --------------
+// The passphrase (the ITN signing secret) NEVER leaves the server. The amount and
+// buyer identity are read from the SERVER's copy of the job — the client cannot
+// dictate what it pays. The caller must present a valid Firebase ID token and must
+// own the job. This replaces the app generating the signature locally.
+app.post('/payfast/checkout', async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ error: 'Payment server not ready' });
+
+    // 1) Authenticate the caller (Firebase ID token in Authorization: Bearer …).
+    const authz = req.headers.authorization || '';
+    const idToken = authz.startsWith('Bearer ') ? authz.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: 'Sign in required' });
+    let uid;
+    try {
+      uid = (await require('firebase-admin').auth().verifyIdToken(idToken)).uid;
+    } catch (e) {
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+
+    // 2) Load the job and verify the caller owns it.
+    const { jobId, mode, itemName, itemDescription } = req.body || {};
+    if (!jobId || typeof jobId !== 'string') return res.status(400).json({ error: 'jobId is required' });
+    const snap = await db.collection('jobs').doc(jobId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Job not found' });
+    const job = snap.data() || {};
+    if (job.customerId !== uid && job.userId !== uid) {
+      return res.status(403).json({ error: 'You do not own this job' });
+    }
+
+    // 3) Amount for THIS charge is read from the job (never signed by the client).
+    //    checkoutAmount is stamped by the app just before checkout and covers both
+    //    the base payment and top-ups (which charge a different amount than the base
+    //    job total). Falls back to the stored job amount. If none, refuse — we do
+    //    not let the client pass a signable price.
+    const amount = Number(job.checkoutAmount != null ? job.checkoutAmount
+      : (job.paymentAmount != null ? job.paymentAmount
+        : (job.price != null ? job.price : (job.pricing && job.pricing.total))));
+    if (!(amount > 0)) return res.status(400).json({ error: 'Job has no payable amount set' });
+
+    // 4) Credentials by mode. Sandbox only for internal test builds; production
+    //    otherwise. Merchant id/key are public (they appear in the URL); the
+    //    passphrase is the secret and stays here.
+    const useSandbox = mode === 'sandbox';
+    const merchant_id = useSandbox ? PAYFAST_SANDBOX_MERCHANT_ID : PAYFAST_PROD_MERCHANT_ID;
+    const merchant_key = useSandbox
+      ? (process.env.PAYFAST_SANDBOX_MERCHANT_KEY || 'ulat5y9vjwiv1')
+      : (process.env.PAYFAST_MERCHANT_KEY || 'xt0kuqu9stwfu');
+    const passphrase = useSandbox ? PAYFAST_SANDBOX_PASSPHRASE : PAYFAST_PROD_PASSPHRASE;
+    const pfHost = useSandbox ? 'https://sandbox.payfast.co.za/eng/process' : 'https://www.payfast.co.za/eng/process';
+
+    // 5) Buyer identity from the server (job + users doc), not the client.
+    const name = job.customerName || job.userName || 'WeTow Customer';
+    let email = job.customerEmail || '';
+    let phone = job.customerPhone || '';
+    if (!email || !phone) {
+      try {
+        const u = await db.collection('users').doc(job.customerId || job.userId || uid).get();
+        const ud = u.exists ? u.data() : {};
+        email = email || ud.email || '';
+        phone = phone || ud.phone || ud.phoneNumber || '';
+      } catch (_) { /* best-effort */ }
+    }
+    const saCell = (() => {
+      let d = String(phone || '').replace(/\D/g, '');
+      if (d.length === 11 && d.startsWith('27')) d = '0' + d.slice(2);
+      else if (d.length === 9) d = '0' + d;
+      return /^0\d{9}$/.test(d) ? d : '';
+    })();
+
+    const base = process.env.PUBLIC_BASE_URL || 'https://wetow-server-1.onrender.com';
+    const params = {
+      merchant_id, merchant_key,
+      return_url: `${base}/payfast/return?jobId=${encodeURIComponent(jobId)}`,
+      cancel_url: `${base}/payfast/cancel?jobId=${encodeURIComponent(jobId)}`,
+      notify_url: `${base}/payfast/webhook`,
+      name_first: (String(name).split(' ')[0] || name).substring(0, 100),
+      name_last: (String(name).split(' ').slice(1).join(' ') || '').substring(0, 100),
+      email_address: email,
+      cell_number: saCell,
+      m_payment_id: jobId,
+      amount: amount.toFixed(2),
+      item_name: String(itemName || `WeTow ${job.serviceType || 'Service'}`).substring(0, 100),
+      item_description: String(itemDescription || `Payment for job ${jobId}`).substring(0, 255),
+    };
+    Object.keys(params).forEach((k) => { if (!params[k]) delete params[k]; });
+
+    const signature = pfSign(params, passphrase);
+    // Submitted values must be encoded exactly as signed (spaces -> '+').
+    const query = Object.entries({ ...params, signature })
+      .map(([k, v]) => `${k}=${encodeURIComponent(String(v)).replace(/%20/g, '+')}`)
+      .join('&');
+
+    console.log(`[PayFast checkout] job ${jobId} amount R${amount.toFixed(2)} (${useSandbox ? 'sandbox' : 'production'}) for ${uid}`);
+    return res.json({ url: `${pfHost}?${query}`, amount, mode: useSandbox ? 'sandbox' : 'production' });
+  } catch (e) {
+    console.error('[PayFast checkout] error:', e.message);
+    return res.status(500).json({ error: 'Could not start checkout' });
+  }
+});
+
 // PayFast ITN (Instant Transaction Notification) Webhook — THE CRITICAL ENDPOINT
 app.post('/payfast/webhook', async (req, res) => {
   console.log('[PayFast ITN] Received:', JSON.stringify(req.body));

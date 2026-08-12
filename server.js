@@ -421,8 +421,23 @@ app.post('/payfast/webhook', async (req, res) => {
         const isTopUp =
           jobData.status === 'reclassification_awaiting_topup' ||
           !!jobData.reclassification?.topUpInitiatedAt;
+        // Family Run top-up — customer paid +R1080 for the driver to transport up to
+        // 4 family members. Operator keeps 100% (credited via operatorEarnings on the
+        // client). Does NOT change job status or the base paymentAmount — it's a flat
+        // add-on flagged paid so the driver is cleared to carry passengers.
+        const isFamilyRunTopUp =
+          !!jobData.familyRun?.topUpInitiatedAt && jobData.familyRun?.status !== 'paid';
 
-        if (isRecoveryTopUp) {
+        if (isFamilyRunTopUp) {
+          await jobRef.update({
+            'familyRun.status': 'paid',
+            'familyRun.paidAt': admin.firestore.FieldValue.serverTimestamp(),
+            'familyRun.topUpPayfastPaymentId': data.pf_payment_id || null,
+            'familyRun.amount': (typeof jobData.familyRun?.amount === 'number' ? jobData.familyRun.amount : amountGross),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          console.log(`[PayFast ITN] Job ${jobId} FAMILY RUN CONFIRMED (${creds.mode}): +R${(jobData.familyRun?.amount || amountGross).toFixed ? (jobData.familyRun?.amount || amountGross).toFixed(2) : (jobData.familyRun?.amount || amountGross)}`);
+        } else if (isRecoveryTopUp) {
           // RECOVERY TOP-UP. Unlike a reclassification (which REPLACES the total),
           // recovery time is ADDITIVE — it stacks on top of what the customer has
           // already paid for the job. Restore the working status the operator was in

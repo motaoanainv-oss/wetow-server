@@ -47,7 +47,15 @@ const PORT = process.env.PORT || 3001;
 
 // Production (live customers)
 const PAYFAST_PROD_MERCHANT_ID = process.env.PAYFAST_MERCHANT_ID || '33800919';
-const PAYFAST_PROD_PASSPHRASE = process.env.PAYFAST_PASSPHRASE || 'WeTow2026_Secure';
+// SECURITY: the production passphrase MUST come from the Render environment. There is
+// deliberately NO hardcoded fallback — the previous default ('WeTow2026_Secure') was
+// bundled into the client at one point and is considered exposed, so it was rotated.
+// If PAYFAST_PASSPHRASE is unset, prod signing/validation fails loudly rather than
+// silently trusting the compromised value.
+const PAYFAST_PROD_PASSPHRASE = process.env.PAYFAST_PASSPHRASE || '';
+if (!PAYFAST_PROD_PASSPHRASE) {
+  console.error('⚠️  PAYFAST_PASSPHRASE is not set — production PayFast checkout/ITN will fail until it is configured in the Render environment.');
+}
 
 // Sandbox (internal testers) — WeTow's OWN sandbox merchant from
 // sandbox.payfast.co.za. The public shared account (10000100) is unreliable: its
